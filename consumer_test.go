@@ -38,9 +38,12 @@ func TestConsumerOffsetManual(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer, err := master.ConsumePartition("my_topic", 0, 1234)
+	consumer, concreteOffset, err := master.ConsumePartition("my_topic", 0, 1234)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if concreteOffset != 1234 {
+		t.Fatalf("Invalid cocrete offset: want=10, got=%d", concreteOffset)
 	}
 
 	// Then: messages starting from offset 1234 are consumed.
@@ -84,13 +87,20 @@ func TestConsumerOffsetNewest(t *testing.T) {
 	}
 
 	// When
-	consumer, err := master.ConsumePartition("my_topic", 0, OffsetNewest)
+	consumer, concreteOffset, err := master.ConsumePartition("my_topic", 0, OffsetNewest)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if concreteOffset != 10 {
+		t.Fatalf("Invalid cocrete offset: want=10, got=%d", concreteOffset)
+	}
 
 	// Then
-	assertMessageOffset(t, <-consumer.Messages(), 10)
+	msg := <-consumer.Messages()
+	assertMessageOffset(t, msg, 10)
+	if msg.HighWaterMark != 14 {
+		t.Errorf("Invalid high water mark: expected=14, actual=%d", msg.HighWaterMark)
+	}
 	if hwmo := consumer.HighWaterMarkOffset(); hwmo != 14 {
 		t.Errorf("Expected high water mark offset 14, found %d", hwmo)
 	}
@@ -120,7 +130,7 @@ func TestConsumerRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pc, err := c.ConsumePartition("my_topic", 0, 10)
+	pc, _, err := c.ConsumePartition("my_topic", 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +138,7 @@ func TestConsumerRecreate(t *testing.T) {
 
 	// When
 	safeClose(t, pc)
-	pc, err = c.ConsumePartition("my_topic", 0, 10)
+	pc, _, err = c.ConsumePartition("my_topic", 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,13 +172,13 @@ func TestConsumerDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pc1, err := c.ConsumePartition("my_topic", 0, 0)
+	pc1, _, err := c.ConsumePartition("my_topic", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// When
-	pc2, err := c.ConsumePartition("my_topic", 0, 0)
+	pc2, _, err := c.ConsumePartition("my_topic", 0, 0)
 
 	// Then
 	if pc2 != nil || err != ConfigurationError("That topic/partition is already being consumed") {
@@ -210,7 +220,7 @@ func TestConsumerLeaderRefreshError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pc, err := c.ConsumePartition("my_topic", 0, OffsetOldest)
+	pc, _, err := c.ConsumePartition("my_topic", 0, OffsetOldest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +238,7 @@ func TestConsumerLeaderRefreshError(t *testing.T) {
 		"FetchRequest": newMockWrapper(fetchResponse2),
 	})
 
-	if consErr := <-pc.Errors(); consErr.Err != ErrOutOfBrokers {
+	if consErr := <-pc.Errors(); consErr.Err != ErrNotLeaderForPartition {
 		t.Errorf("Unexpected error: %v", consErr.Err)
 	}
 
@@ -272,7 +282,7 @@ func TestConsumerInvalidTopic(t *testing.T) {
 	}
 
 	// When
-	pc, err := c.ConsumePartition("my_topic", 0, OffsetOldest)
+	pc, _, err := c.ConsumePartition("my_topic", 0, OffsetOldest)
 
 	// Then
 	if pc != nil || err != ErrUnknownTopicOrPartition {
@@ -309,7 +319,7 @@ func TestConsumerClosePartitionWithoutLeader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pc, err := c.ConsumePartition("my_topic", 0, OffsetOldest)
+	pc, _, err := c.ConsumePartition("my_topic", 0, OffsetOldest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +336,7 @@ func TestConsumerClosePartitionWithoutLeader(t *testing.T) {
 	})
 
 	// When
-	if consErr := <-pc.Errors(); consErr.Err != ErrOutOfBrokers {
+	if consErr := <-pc.Errors(); consErr.Err != ErrNotLeaderForPartition {
 		t.Errorf("Unexpected error: %v", consErr.Err)
 	}
 
@@ -360,7 +370,7 @@ func TestConsumerShutsDownOutOfRange(t *testing.T) {
 	}
 
 	// When
-	consumer, err := master.ConsumePartition("my_topic", 0, 101)
+	consumer, _, err := master.ConsumePartition("my_topic", 0, 101)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +413,7 @@ func TestConsumerExtraOffsets(t *testing.T) {
 	}
 
 	// When
-	consumer, err := master.ConsumePartition("my_topic", 0, 3)
+	consumer, _, err := master.ConsumePartition("my_topic", 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +455,7 @@ func TestConsumerNonSequentialOffsets(t *testing.T) {
 	}
 
 	// When
-	consumer, err := master.ConsumePartition("my_topic", 0, 3)
+	consumer, _, err := master.ConsumePartition("my_topic", 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +503,7 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 
 	// launch test goroutines
 	config := NewConfig()
-	config.Consumer.Retry.Backoff = 50
+	config.Consumer.Retry.Backoff = 50 * time.Millisecond
 	master, err := NewConsumer([]string{seedBroker.Addr()}, config)
 	if err != nil {
 		t.Fatal(err)
@@ -502,7 +512,7 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 	// we expect to end up (eventually) consuming exactly ten messages on each partition
 	var wg sync.WaitGroup
 	for i := int32(0); i < 2; i++ {
-		consumer, err := master.ConsumePartition("my_topic", i, 0)
+		consumer, _, err := master.ConsumePartition("my_topic", i, 0)
 		if err != nil {
 			t.Error(err)
 		}
@@ -566,12 +576,12 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	Logger.Printf("    STAGE 3")
 	// Stage 3:
-	//   * my_topic/0 -> leader1 serves 3 messages
+	//   * my_topic/0 -> leader1 serves 6 messages
 	//   * my_topic/1 -> leader1 server 8 messages
 
 	// leader1 provides 3 message on partition 0, and 8 messages on partition 1
 	mockFetchResponse2 := newMockFetchResponse(t, 2)
-	for i := 4; i < 7; i++ {
+	for i := 4; i < 10; i++ {
 		mockFetchResponse2.SetMessage("my_topic", 0, int64(i), testMsg)
 	}
 	for i := 0; i < 8; i++ {
@@ -584,7 +594,6 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	Logger.Printf("    STAGE 4")
 	// Stage 4:
-	//   * my_topic/0 -> leader1 serves 3 messages
 	//   * my_topic/1 -> leader1 tells that it is no longer the leader
 	//   * seedBroker tells that leader0 is a new leader for my_topic/1
 
@@ -595,15 +604,11 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 			SetLeader("my_topic", 1, leader0.BrokerID()),
 	})
 
-	// leader1 provides three more messages on partition0, says no longer leader of partition1
-	mockFetchResponse3 := newMockFetchResponse(t, 3).
-		SetMessage("my_topic", 0, int64(7), testMsg).
-		SetMessage("my_topic", 0, int64(8), testMsg).
-		SetMessage("my_topic", 0, int64(9), testMsg)
+	// leader1 says no longer leader of partition1
 	fetchResponse4 := new(FetchResponse)
 	fetchResponse4.AddError("my_topic", 1, ErrNotLeaderForPartition)
 	leader1.SetHandlerByMap(map[string]MockResponse{
-		"FetchRequest": newMockSequence(mockFetchResponse3, fetchResponse4),
+		"FetchRequest": newMockWrapper(fetchResponse4),
 	})
 
 	// leader0 provides two messages on partition 1
@@ -652,12 +657,12 @@ func TestConsumerInterleavedClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c0, err := master.ConsumePartition("my_topic", 0, 1000)
+	c0, _, err := master.ConsumePartition("my_topic", 0, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c1, err := master.ConsumePartition("my_topic", 1, 2000)
+	c1, _, err := master.ConsumePartition("my_topic", 1, 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,12 +720,12 @@ func TestConsumerBounceWithReferenceOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c0, err := master.ConsumePartition("my_topic", 0, 1000)
+	c0, _, err := master.ConsumePartition("my_topic", 0, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c1, err := master.ConsumePartition("my_topic", 1, 2000)
+	c1, _, err := master.ConsumePartition("my_topic", 1, 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,18 +794,49 @@ func TestConsumerOffsetOutOfRange(t *testing.T) {
 	}
 
 	// When/Then
-	if _, err := master.ConsumePartition("my_topic", 0, 0); err != ErrOffsetOutOfRange {
+	if _, _, err := master.ConsumePartition("my_topic", 0, 0); err != ErrOffsetOutOfRange {
 		t.Fatal("Should return ErrOffsetOutOfRange, got:", err)
 	}
-	if _, err := master.ConsumePartition("my_topic", 0, 3456); err != ErrOffsetOutOfRange {
+	if _, _, err := master.ConsumePartition("my_topic", 0, 3456); err != ErrOffsetOutOfRange {
 		t.Fatal("Should return ErrOffsetOutOfRange, got:", err)
 	}
-	if _, err := master.ConsumePartition("my_topic", 0, -3); err != ErrOffsetOutOfRange {
+	if _, _, err := master.ConsumePartition("my_topic", 0, -3); err != ErrOffsetOutOfRange {
 		t.Fatal("Should return ErrOffsetOutOfRange, got:", err)
 	}
 
 	safeClose(t, master)
 	broker0.Close()
+}
+
+// When a master consumer is closed all kittens gets killed.
+func TestConsumerClose(t *testing.T) {
+	// Given
+	broker0 := newMockBroker(t, 0)
+	defer broker0.Close()
+
+	broker0.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": newMockMetadataResponse(t).
+			SetBroker(broker0.Addr(), broker0.BrokerID()).
+			SetLeader("my_topic", 0, broker0.BrokerID()),
+		"OffsetRequest": newMockOffsetResponse(t).
+			SetOffset("my_topic", 0, OffsetNewest, 100).
+			SetOffset("my_topic", 0, OffsetOldest, 1),
+	})
+
+	config := NewConfig()
+	config.Net.ReadTimeout = 500 * time.Millisecond
+	master, err := NewConsumer([]string{broker0.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The mock broker is configured not to reply to FetchRequest's. That will
+	// make some internal goroutine block for `Config.Net.ReadTimeout`.
+	_, _, _ = master.ConsumePartition("my_topic", 0, OffsetNewest)
+
+	// When/Then: close the consumer while an internal broker consumer is
+	// waiting for a response.
+	safeClose(t, master)
 }
 
 func assertMessageOffset(t *testing.T, msg *ConsumerMessage, expectedOffset int64) {
@@ -823,7 +859,7 @@ func ExampleConsumer() {
 		}
 	}()
 
-	partitionConsumer, err := consumer.ConsumePartition("my_topic", 0, OffsetNewest)
+	partitionConsumer, _, err := consumer.ConsumePartition("my_topic", 0, OffsetNewest)
 	if err != nil {
 		panic(err)
 	}

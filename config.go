@@ -183,6 +183,12 @@ type Config struct {
 			// The initial offset to use if no offset was previously committed.
 			// Should be OffsetNewest or OffsetOldest. Defaults to OffsetNewest.
 			Initial int64
+
+			// How long to wait for an offset commit request to complete. If
+			// this timeout expires the respective coordinator will be refreshed
+			// in case it has changed and the offset commit request will be
+			// retried.
+			Timeout time.Duration
 		}
 	}
 
@@ -226,6 +232,7 @@ func NewConfig() *Config {
 	c.Consumer.Return.Errors = false
 	c.Consumer.Offsets.CommitInterval = 1 * time.Second
 	c.Consumer.Offsets.Initial = OffsetNewest
+	c.Consumer.Offsets.Timeout = 3 * time.Second
 
 	c.ChannelBufferSize = 256
 
@@ -329,7 +336,8 @@ func (c *Config) Validate() error {
 		return ConfigurationError("Consumer.Offsets.CommitInterval must be > 0")
 	case c.Consumer.Offsets.Initial != OffsetOldest && c.Consumer.Offsets.Initial != OffsetNewest:
 		return ConfigurationError("Consumer.Offsets.Initial must be OffsetOldest or OffsetNewest")
-
+	case c.Consumer.Offsets.Timeout <= 0:
+		return ConfigurationError("Consumer.Offsets.Timeout must be > 0")
 	}
 
 	// validate misc shared values
