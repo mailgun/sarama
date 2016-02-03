@@ -2,46 +2,50 @@ package sarama
 
 import (
 	"testing"
+	"time"
 )
 
+// The latest committed offset saved by one partition manager instance is
+// returned by another as the initial commit.
 func TestFuncOffsetManager(t *testing.T) {
 	checkKafkaVersion(t, "0.8.2")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	client, err := NewClient(kafkaBrokers, nil)
+	// Given
+	newOffset := time.Now().Unix()
+
+	config := NewConfig()
+	client, err := NewClient(kafkaBrokers, config)
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
-
-	offsetManager, err := NewOffsetManagerFromClient("sarama.TestFuncOffsetManager", client)
+	offsetMgr, err := NewOffsetManagerFromClient(client)
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
-
-	pom1, err := offsetManager.ManagePartition("test.1", 0)
+	pom0_1, err := offsetMgr.ManagePartition("test", "test.4", 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
 
-	pom1.MarkOffset(10, "test metadata")
-	safeClose(t, pom1)
+	// When: several offsets are committed.
+	pom0_1.SubmitOffset(newOffset, "foo")
+	pom0_1.SubmitOffset(newOffset+1, "bar")
+	pom0_1.SubmitOffset(newOffset+2, "bazz")
 
-	pom2, err := offsetManager.ManagePartition("test.1", 0)
+	// Then: last committed request is the one that becomes effective.
+	pom0_1.Close()
+	pom0_2, err := offsetMgr.ManagePartition("test", "test.4", 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
 
-	offset, metadata := pom2.NextOffset()
+	fo := <-pom0_2.InitialOffset()
 
-	if offset != 10+1 {
-		t.Errorf("Expected the next offset to be 11, found %d.", offset)
-	}
-	if metadata != "test metadata" {
-		t.Errorf("Expected metadata to be 'test metadata', found %s.", metadata)
+	if (fo != DecoratedOffset{newOffset + 2, "bazz"}) {
+		t.Errorf("Unexpected offset: %v", fo)
 	}
 
-	safeClose(t, pom2)
-	safeClose(t, offsetManager)
-	safeClose(t, client)
+	offsetMgr.Close()
 }

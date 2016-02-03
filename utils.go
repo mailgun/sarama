@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"net"
 	"sort"
+	"sync"
 )
 
 type none struct{}
+
+// nothing is the only existing value of type `none`
+var nothing = none{}
 
 // make []int32 sortable so we can sort partition numbers
 type int32Slice []int32
@@ -108,4 +112,14 @@ func newBufConn(conn net.Conn) *bufConn {
 
 func (bc *bufConn) Read(b []byte) (n int, err error) {
 	return bc.buf.Read(b)
+}
+
+// spawn starts function `f` as a goroutine making it a member of the `wg`
+// wait group.
+func spawn(wg *sync.WaitGroup, f func()) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		f()
+	}()
 }

@@ -1,516 +1,500 @@
 package sarama
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
 
-// Offset Manager
+var ErrOffsetMgrNoCoordinator = errors.New("failed to resolve coordinator")
+var ErrOffsetMgrRequestTimeout = errors.New("request timeout")
 
-// OffsetManager uses Kafka to store and fetch consumed partition offsets.
+// OffsetManager uses Kafka to store consumed partition offsets.
 type OffsetManager interface {
-	// ManagePartition creates a PartitionOffsetManager on the given topic/partition.
-	// It will return an error if this OffsetManager is already managing the given
-	// topic/partition.
-	ManagePartition(topic string, partition int32) (PartitionOffsetManager, error)
+	// ManagePartition creates a PartitionOffsetManager on the given
+	// group/topic/partition. It returns an error if this OffsetManager is
+	// already managing the given group/topic/partition.
+	ManagePartition(group, topic string, partition int32) (PartitionOffsetManager, error)
 
-	// Close stops the OffsetManager from managing offsets. It is required to call
-	// this function before an OffsetManager object passes out of scope, as it
-	// will otherwise leak memory. You must call this after all the
-	// PartitionOffsetManagers are closed.
-	Close() error
+	// Close terminates all spawned PartitionOffsetManager's and waits for them
+	// to commit pending offsets. So it is not necessary to call Close methods
+	// of spawned PartitionOffsetManagers explicitly.
+	Close()
 }
 
 type offsetManager struct {
-	client Client
-	conf   *Config
-	group  string
+	baseCID      *ContextID
+	client       Client
+	config       *Config
+	mapper       *partition2BrokerMapper
+	children     map[groupTopicPartition]*partitionOffsetMgr
+	childrenLock sync.Mutex
+}
 
-	lock sync.Mutex
-	poms map[string]map[int32]*partitionOffsetManager
-	boms map[*Broker]*brokerOffsetManager
+type groupTopicPartition struct {
+	group     string
+	topic     string
+	partition int32
 }
 
 // NewOffsetManagerFromClient creates a new OffsetManager from the given client.
-// It is still necessary to call Close() on the underlying client when finished with the partition manager.
-func NewOffsetManagerFromClient(group string, client Client) (OffsetManager, error) {
-	// Check that we are not dealing with a closed Client before processing any other arguments
+// It is still necessary to call Close() on the underlying client when finished
+// with the partition manager.
+func NewOffsetManagerFromClient(client Client) (OffsetManager, error) {
+	// Check that we are not dealing with a closed Client before processing any
+	// other arguments
 	if client.Closed() {
 		return nil, ErrClosedClient
 	}
-
 	om := &offsetManager{
-		client: client,
-		conf:   client.Config(),
-		group:  group,
-		poms:   make(map[string]map[int32]*partitionOffsetManager),
-		boms:   make(map[*Broker]*brokerOffsetManager),
+		baseCID:  RootCID.NewChild("offsetManager"),
+		client:   client,
+		config:   client.Config(),
+		children: make(map[groupTopicPartition]*partitionOffsetMgr),
 	}
-
+	om.mapper = spawnPartition2BrokerMapper(om.baseCID, om)
 	return om, nil
 }
 
-func (om *offsetManager) ManagePartition(topic string, partition int32) (PartitionOffsetManager, error) {
-	pom, err := om.newPartitionOffsetManager(topic, partition)
-	if err != nil {
-		return nil, err
+func (om *offsetManager) Close() {
+	om.childrenLock.Lock()
+	for _, pom := range om.children {
+		close(pom.submittedOffsetsCh)
+		pom.wg.Wait()
+		pom.om.mapper.workerClosed() <- pom
 	}
+	om.childrenLock.Unlock()
+	om.mapper.close()
+}
 
-	om.lock.Lock()
-	defer om.lock.Unlock()
+func (om *offsetManager) ManagePartition(group, topic string, partition int32) (PartitionOffsetManager, error) {
+	gtp := groupTopicPartition{group, topic, partition}
 
-	topicManagers := om.poms[topic]
-	if topicManagers == nil {
-		topicManagers = make(map[int32]*partitionOffsetManager)
-		om.poms[topic] = topicManagers
-	}
-
-	if topicManagers[partition] != nil {
+	om.childrenLock.Lock()
+	defer om.childrenLock.Unlock()
+	if _, ok := om.children[gtp]; ok {
 		return nil, ConfigurationError("That topic/partition is already being managed")
 	}
-
-	topicManagers[partition] = pom
+	pom := om.spawnPartitionOffsetManager(gtp)
+	om.mapper.workerCreated() <- pom
+	om.children[gtp] = pom
 	return pom, nil
 }
 
-func (om *offsetManager) Close() error {
-	return nil
-}
-
-func (om *offsetManager) refBrokerOffsetManager(broker *Broker) *brokerOffsetManager {
-	om.lock.Lock()
-	defer om.lock.Unlock()
-
-	bom := om.boms[broker]
-	if bom == nil {
-		bom = om.newBrokerOffsetManager(broker)
-		om.boms[broker] = bom
-	}
-
-	bom.refs++
-
-	return bom
-}
-
-func (om *offsetManager) unrefBrokerOffsetManager(bom *brokerOffsetManager) {
-	om.lock.Lock()
-	defer om.lock.Unlock()
-
-	bom.refs--
-
-	if bom.refs == 0 {
-		close(bom.updateSubscriptions)
-		if om.boms[bom.broker] == bom {
-			delete(om.boms, bom.broker)
-		}
-	}
-}
-
-func (om *offsetManager) abandonBroker(bom *brokerOffsetManager) {
-	om.lock.Lock()
-	defer om.lock.Unlock()
-
-	delete(om.boms, bom.broker)
-}
-
-func (om *offsetManager) abandonPartitionOffsetManager(pom *partitionOffsetManager) {
-	om.lock.Lock()
-	defer om.lock.Unlock()
-
-	delete(om.poms[pom.topic], pom.partition)
-	if len(om.poms[pom.topic]) == 0 {
-		delete(om.poms, pom.topic)
-	}
-}
-
-// Partition Offset Manager
-
-// PartitionOffsetManager uses Kafka to store and fetch consumed partition offsets. You MUST call Close()
-// on a partition offset manager to avoid leaks, it will not be garbage-collected automatically when it passes
-// out of scope.
-type PartitionOffsetManager interface {
-	// NextOffset returns the next offset that should be consumed for the managed
-	// partition, accompanied by metadata which can be used to reconstruct the state
-	// of the partition consumer when it resumes. NextOffset() will return
-	// `config.Consumer.Offsets.Initial` and an empty metadata string if no offset
-	// was committed for this partition yet.
-	NextOffset() (int64, string)
-
-	// MarkOffset marks the provided offset as processed, alongside a metadata string
-	// that represents the state of the partition consumer at that point in time. The
-	// metadata string can be used by another consumer to restore that state, so it
-	// can resume consumption.
-	//
-	// Note: calling MarkOffset does not necessarily commit the offset to the backend
-	// store immediately for efficiency reasons, and it may never be committed if
-	// your application crashes. This means that you may end up processing the same
-	// message twice, and your processing should ideally be idempotent.
-	MarkOffset(offset int64, metadata string)
-
-	// Errors returns a read channel of errors that occur during offset management, if
-	// enabled. By default, errors are logged and not returned over this channel. If
-	// you want to implement any custom error handling, set your config's
-	// Consumer.Return.Errors setting to true, and read from this channel.
-	Errors() <-chan *ConsumerError
-
-	// AsyncClose initiates a shutdown of the PartitionOffsetManager. This method will
-	// return immediately, after which you should wait until the 'errors' channel has
-	// been drained and closed. It is required to call this function, or Close before
-	// a consumer object passes out of scope, as it will otherwise leak memory. You
-	// must call this before calling Close on the underlying client.
-	AsyncClose()
-
-	// Close stops the PartitionOffsetManager from managing offsets. It is required to
-	// call this function (or AsyncClose) before a PartitionOffsetManager object
-	// passes out of scope, as it will otherwise leak memory. You must call this
-	// before calling Close on the underlying client.
-	Close() error
-}
-
-type partitionOffsetManager struct {
-	parent    *offsetManager
-	topic     string
-	partition int32
-
-	lock     sync.Mutex
-	offset   int64
-	metadata string
-	dirty    bool
-	clean    chan none
-	broker   *brokerOffsetManager
-
-	errors    chan *ConsumerError
-	rebalance chan none
-	dying     chan none
-}
-
-func (om *offsetManager) newPartitionOffsetManager(topic string, partition int32) (*partitionOffsetManager, error) {
-	pom := &partitionOffsetManager{
-		parent:    om,
-		topic:     topic,
-		partition: partition,
-		clean:     make(chan none),
-		errors:    make(chan *ConsumerError, om.conf.ChannelBufferSize),
-		rebalance: make(chan none, 1),
-		dying:     make(chan none),
-	}
-
-	if err := pom.selectBroker(); err != nil {
+func (om *offsetManager) resolveBroker(pw partitionWorker) (*Broker, error) {
+	pom := pw.(*partitionOffsetMgr)
+	if err := om.client.RefreshCoordinator(pom.gtp.group); err != nil {
 		return nil, err
 	}
 
-	if err := pom.fetchInitialOffset(om.conf.Metadata.Retry.Max); err != nil {
-		return nil, err
-	}
-
-	pom.broker.updateSubscriptions <- pom
-
-	go withRecover(pom.mainLoop)
-
-	return pom, nil
-}
-
-func (pom *partitionOffsetManager) mainLoop() {
-	for {
-		select {
-		case <-pom.rebalance:
-			if err := pom.selectBroker(); err != nil {
-				pom.handleError(err)
-				pom.rebalance <- none{}
-			} else {
-				pom.broker.updateSubscriptions <- pom
-			}
-		case <-pom.dying:
-			if pom.broker != nil {
-				select {
-				case <-pom.rebalance:
-				case pom.broker.updateSubscriptions <- pom:
-				}
-				pom.parent.unrefBrokerOffsetManager(pom.broker)
-			}
-			pom.parent.abandonPartitionOffsetManager(pom)
-			close(pom.errors)
-			return
-		}
-	}
-}
-
-func (pom *partitionOffsetManager) selectBroker() error {
-	if pom.broker != nil {
-		pom.parent.unrefBrokerOffsetManager(pom.broker)
-		pom.broker = nil
-	}
-
-	var broker *Broker
-	var err error
-
-	if err = pom.parent.client.RefreshCoordinator(pom.parent.group); err != nil {
-		return err
-	}
-
-	if broker, err = pom.parent.client.Coordinator(pom.parent.group); err != nil {
-		return err
-	}
-
-	pom.broker = pom.parent.refBrokerOffsetManager(broker)
-	return nil
-}
-
-func (pom *partitionOffsetManager) fetchInitialOffset(retries int) error {
-	request := new(OffsetFetchRequest)
-	request.Version = 1
-	request.ConsumerGroup = pom.parent.group
-	request.AddPartition(pom.topic, pom.partition)
-
-	response, err := pom.broker.broker.FetchOffset(request)
+	brokerConn, err := om.client.Coordinator(pom.gtp.group)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	return brokerConn, nil
+}
 
-	block := response.GetBlock(pom.topic, pom.partition)
-	if block == nil {
-		return ErrIncompleteResponse
+// PartitionOffsetManager uses Kafka to fetch consumed partition offsets. You
+// MUST call Close() on a partition offset manager to avoid leaks, it will not
+// be garbage-collected automatically when it passes out of scope.
+type PartitionOffsetManager interface {
+	// InitialOffset returns a channel that an initial offset will be sent down
+	// to, when retrieved. At most one value will be sent down to this channel,
+	// and it will be closed immediately after that. If error reporting is
+	// enabled with `Config.Consumer.Return.Errors` then errors may be coming
+	// and has to be read from the `Errors()` channel, otherwise the partition
+	// offset manager will get into a dead lock.
+	InitialOffset() <-chan DecoratedOffset
+
+	// SubmitOffset triggers saving of the specified offset in Kafka. Commits
+	// are performed periodically in a background goroutine. The commit
+	// interval is configured by `Config.Consumer.Offsets.CommitInterval`. Note
+	// that not every submitted offset gets committed. Committed offsets are
+	// sent down to the `CommittedOffsets()` channel. The `CommittedOffsets()`
+	// channel has to be read alongside with submitting offsets, otherwise the
+	// partition offset manager will block.
+	SubmitOffset(offset int64, metadata string)
+
+	// CommittedOffsets returns a channel that offsets committed to Kafka are
+	// sent down to. The user must read from this channel otherwise a
+	// `SubmitOffset` will eventually block.
+	CommittedOffsets() <-chan DecoratedOffset
+
+	// Errors returns a read channel of errors that occur during offset
+	// management, if enabled. By default errors are not returned. If you want
+	// to implement any custom error handling logic then you need to set
+	// `Consumer.Return.Errors` to true, and read from this channel.
+	Errors() <-chan *OffsetCommitError
+
+	// Close stops the PartitionOffsetManager from managing offsets. It is
+	// required to call this function before a PartitionOffsetManager object
+	// passes out of scope, as it will otherwise leak memory.
+	//
+	// It is guaranteed that the most recent offset is committed before `Close`
+	// returns.
+	Close()
+}
+
+type DecoratedOffset struct {
+	Offset   int64
+	Metadata string
+}
+
+type OffsetCommitError struct {
+	Group     string
+	Topic     string
+	Partition int32
+	Err       error
+}
+
+type partitionOffsetMgr struct {
+	baseCID            *ContextID
+	om                 *offsetManager
+	gtp                groupTopicPartition
+	initialOffsetCh    chan DecoratedOffset
+	submittedOffsetsCh chan submittedOffset
+	assignmentCh       chan brokerExecutor
+	committedOffsetsCh chan DecoratedOffset
+	errorsCh           chan *OffsetCommitError
+	wg                 sync.WaitGroup
+}
+
+func (om *offsetManager) spawnPartitionOffsetManager(gtp groupTopicPartition) *partitionOffsetMgr {
+	pom := &partitionOffsetMgr{
+		baseCID:            om.baseCID.NewChild(fmt.Sprintf("%s:%s:%d", gtp.group, gtp.topic, gtp.partition)),
+		om:                 om,
+		gtp:                gtp,
+		initialOffsetCh:    make(chan DecoratedOffset, 1),
+		submittedOffsetsCh: make(chan submittedOffset),
+		assignmentCh:       make(chan brokerExecutor, 1),
+		committedOffsetsCh: make(chan DecoratedOffset, om.config.ChannelBufferSize),
+		errorsCh:           make(chan *OffsetCommitError, om.config.ChannelBufferSize),
 	}
+	spawn(&pom.wg, pom.processCommits)
+	return pom
+}
 
-	switch block.Err {
-	case ErrNoError:
-		pom.offset = block.Offset
-		pom.metadata = block.Metadata
-		return nil
-	case ErrNotCoordinatorForConsumer:
-		if retries <= 0 {
-			return block.Err
+func (pom *partitionOffsetMgr) InitialOffset() <-chan DecoratedOffset {
+	return pom.initialOffsetCh
+}
+
+func (pom *partitionOffsetMgr) SubmitOffset(offset int64, metadata string) {
+	pom.submittedOffsetsCh <- submittedOffset{
+		gtp:      pom.gtp,
+		offset:   offset,
+		metadata: metadata,
+	}
+}
+
+func (pom *partitionOffsetMgr) CommittedOffsets() <-chan DecoratedOffset {
+	return pom.committedOffsetsCh
+}
+
+func (pom *partitionOffsetMgr) Errors() <-chan *OffsetCommitError {
+	return pom.errorsCh
+}
+
+func (pom *partitionOffsetMgr) Close() {
+	pom.om.childrenLock.Lock()
+	close(pom.submittedOffsetsCh)
+	delete(pom.om.children, pom.gtp)
+	pom.om.childrenLock.Unlock()
+	pom.wg.Wait()
+	pom.om.mapper.workerClosed() <- pom
+}
+
+func (pom *partitionOffsetMgr) String() string {
+	return pom.baseCID.String()
+}
+
+func (pom *partitionOffsetMgr) assignment() chan<- brokerExecutor {
+	return pom.assignmentCh
+}
+
+func (pom *partitionOffsetMgr) processCommits() {
+	cid := pom.baseCID.NewChild("processCommits")
+	defer cid.LogScope()()
+	defer close(pom.committedOffsetsCh)
+	defer close(pom.errorsCh)
+	var (
+		commitResultCh            = make(chan commitResult, 1)
+		initialOffsetFetched      = false
+		isDirty                   = false
+		isPending                 = false
+		closed                    = false
+		nilOrSubmittedOffsetsCh   = pom.submittedOffsetsCh
+		commitTicker              = time.NewTicker(pom.om.config.Consumer.Offsets.CommitInterval)
+		recentSubmittedOffset     submittedOffset
+		assignedBrokerCommitsCh   chan<- submittedOffset
+		nilOrBrokerCommitsCh      chan<- submittedOffset
+		nilOrReassignRetryTimerCh <-chan time.Time
+		lastCommitTime            time.Time
+		lastReassignTime          time.Time
+	)
+	defer commitTicker.Stop()
+	triggerOrScheduleReassign := func(err error, reason string) {
+		pom.reportError(err)
+		assignedBrokerCommitsCh = nil
+		nilOrBrokerCommitsCh = nil
+		now := time.Now().UTC()
+		if now.Sub(lastReassignTime) > pom.om.config.Consumer.Retry.Backoff {
+			Logger.Printf("<%s> trigger reassign: reason=%s, err=(%s)", cid, reason, err)
+			lastReassignTime = now
+			pom.om.mapper.workerReassign() <- pom
+		} else {
+			Logger.Printf("<%s> schedule reassign: reason=%s, err=(%s)", cid, reason, err)
 		}
-		if err := pom.selectBroker(); err != nil {
-			return err
-		}
-		return pom.fetchInitialOffset(retries - 1)
-	case ErrOffsetsLoadInProgress:
-		if retries <= 0 {
-			return block.Err
-		}
-		time.Sleep(pom.parent.conf.Metadata.Retry.Backoff)
-		return pom.fetchInitialOffset(retries - 1)
-	default:
-		return block.Err
+		nilOrReassignRetryTimerCh = time.After(pom.om.config.Consumer.Retry.Backoff)
 	}
-}
-
-func (pom *partitionOffsetManager) handleError(err error) {
-	cErr := &ConsumerError{
-		Topic:     pom.topic,
-		Partition: pom.partition,
-		Err:       err,
-	}
-
-	if pom.parent.conf.Consumer.Return.Errors {
-		pom.errors <- cErr
-	} else {
-		Logger.Println(cErr)
-	}
-}
-
-func (pom *partitionOffsetManager) Errors() <-chan *ConsumerError {
-	return pom.errors
-}
-
-func (pom *partitionOffsetManager) MarkOffset(offset int64, metadata string) {
-	pom.lock.Lock()
-	defer pom.lock.Unlock()
-
-	if offset > pom.offset {
-		pom.offset = offset
-		pom.metadata = metadata
-		pom.dirty = true
-	}
-}
-
-func (pom *partitionOffsetManager) updateCommitted(offset int64, metadata string) {
-	pom.lock.Lock()
-	defer pom.lock.Unlock()
-
-	if pom.offset == offset && pom.metadata == metadata {
-		pom.dirty = false
-
-		select {
-		case pom.clean <- none{}:
-		default:
-		}
-	}
-}
-
-func (pom *partitionOffsetManager) NextOffset() (int64, string) {
-	pom.lock.Lock()
-	defer pom.lock.Unlock()
-
-	if pom.offset >= 0 {
-		return pom.offset + 1, pom.metadata
-	}
-
-	return pom.parent.conf.Consumer.Offsets.Initial, ""
-}
-
-func (pom *partitionOffsetManager) AsyncClose() {
-	go func() {
-		pom.lock.Lock()
-		dirty := pom.dirty
-		pom.lock.Unlock()
-
-		if dirty {
-			<-pom.clean
-		}
-
-		close(pom.dying)
-	}()
-}
-
-func (pom *partitionOffsetManager) Close() error {
-	pom.AsyncClose()
-
-	var errors ConsumerErrors
-	for err := range pom.errors {
-		errors = append(errors, err)
-	}
-
-	if len(errors) > 0 {
-		return errors
-	}
-	return nil
-}
-
-// Broker Offset Manager
-
-type brokerOffsetManager struct {
-	parent              *offsetManager
-	broker              *Broker
-	timer               *time.Ticker
-	updateSubscriptions chan *partitionOffsetManager
-	subscriptions       map[*partitionOffsetManager]none
-	refs                int
-}
-
-func (om *offsetManager) newBrokerOffsetManager(broker *Broker) *brokerOffsetManager {
-	bom := &brokerOffsetManager{
-		parent:              om,
-		broker:              broker,
-		timer:               time.NewTicker(om.conf.Consumer.Offsets.CommitInterval),
-		updateSubscriptions: make(chan *partitionOffsetManager),
-		subscriptions:       make(map[*partitionOffsetManager]none),
-	}
-
-	go withRecover(bom.mainLoop)
-
-	return bom
-}
-
-func (bom *brokerOffsetManager) mainLoop() {
 	for {
 		select {
-		case <-bom.timer.C:
-			if len(bom.subscriptions) > 0 {
-				bom.flushToBroker()
+		case bw := <-pom.assignmentCh:
+			if bw == nil {
+				assignedBrokerCommitsCh = nil
+				triggerOrScheduleReassign(ErrOffsetMgrNoCoordinator, "retry reassignment")
+				continue
 			}
-		case s, ok := <-bom.updateSubscriptions:
+			bom := bw.(*brokerOffsetMgr)
+			nilOrReassignRetryTimerCh = nil
+			assignedBrokerCommitsCh = bom.submittedOffsetsCh
+
+			if !initialOffsetFetched {
+				initialOffset, err := pom.fetchInitialOffset(bom.conn)
+				if err != nil {
+					triggerOrScheduleReassign(err, "failed to fetch initial offset")
+					continue
+				}
+				pom.initialOffsetCh <- initialOffset
+				close(pom.initialOffsetCh)
+				initialOffsetFetched = true
+			}
+			if isDirty {
+				nilOrBrokerCommitsCh = assignedBrokerCommitsCh
+			}
+		case so, ok := <-nilOrSubmittedOffsetsCh:
 			if !ok {
-				bom.timer.Stop()
+				if isDirty || isPending {
+					closed, nilOrSubmittedOffsetsCh = true, nil
+					continue
+				}
 				return
 			}
-			if _, ok := bom.subscriptions[s]; ok {
-				delete(bom.subscriptions, s)
-			} else {
-				bom.subscriptions[s] = none{}
+			recentSubmittedOffset = so
+			recentSubmittedOffset.resultCh = commitResultCh
+			isDirty = true
+			nilOrBrokerCommitsCh = assignedBrokerCommitsCh
+
+		case nilOrBrokerCommitsCh <- recentSubmittedOffset:
+			nilOrBrokerCommitsCh = nil
+			isDirty = false
+			if !isPending {
+				isPending, lastCommitTime = true, time.Now().UTC()
+			}
+		case cr := <-commitResultCh:
+			isPending = false
+			if err := pom.getCommitError(cr.response); err != nil {
+				isDirty = true
+				triggerOrScheduleReassign(err, "offset commit failed")
+				continue
+			}
+			pom.committedOffsetsCh <- DecoratedOffset{cr.offsetCommit.offset, cr.offsetCommit.metadata}
+			if closed && !isDirty {
+				return
+			}
+		case <-commitTicker.C:
+			if isPending && time.Now().UTC().Sub(lastCommitTime) > pom.om.config.Consumer.Offsets.Timeout {
+				isDirty, isPending = true, false
+				triggerOrScheduleReassign(ErrOffsetMgrRequestTimeout, "offset commit failed")
+			}
+		case <-nilOrReassignRetryTimerCh:
+			pom.om.mapper.workerReassign() <- pom
+			Logger.Printf("<%s> reassign triggered by timeout", cid)
+			nilOrReassignRetryTimerCh = time.After(pom.om.config.Consumer.Retry.Backoff)
+		}
+	}
+}
+
+func (pom *partitionOffsetMgr) fetchInitialOffset(conn *Broker) (DecoratedOffset, error) {
+	request := new(OffsetFetchRequest)
+	request.Version = 1
+	request.ConsumerGroup = pom.gtp.group
+	request.AddPartition(pom.gtp.topic, pom.gtp.partition)
+
+	response, err := conn.FetchOffset(request)
+	if err != nil {
+		// In case of network error the connection has to be explicitly closed,
+		// otherwise it won't be re-establish and following requests to this
+		// broker will fail as well.
+		_ = conn.Close()
+		return DecoratedOffset{}, err
+	}
+	block := response.GetBlock(pom.gtp.topic, pom.gtp.partition)
+	if block == nil {
+		return DecoratedOffset{}, ErrIncompleteResponse
+	}
+	if block.Err != ErrNoError {
+		return DecoratedOffset{}, block.Err
+	}
+	fetchedOffset := DecoratedOffset{block.Offset, block.Metadata}
+	return fetchedOffset, nil
+}
+
+func (pom *partitionOffsetMgr) reportError(err error) {
+	if !pom.om.config.Consumer.Return.Errors {
+		return
+	}
+	oce := &OffsetCommitError{
+		Group:     pom.gtp.group,
+		Topic:     pom.gtp.topic,
+		Partition: pom.gtp.partition,
+		Err:       err,
+	}
+	select {
+	case pom.errorsCh <- oce:
+	default:
+	}
+}
+
+func (pom *partitionOffsetMgr) getCommitError(res *OffsetCommitResponse) error {
+	if res.Errors[pom.gtp.topic] == nil {
+		return ErrIncompleteResponse
+	}
+	err, ok := res.Errors[pom.gtp.topic][pom.gtp.partition]
+	if !ok {
+		return ErrIncompleteResponse
+	}
+	if err != ErrNoError {
+		return err
+	}
+	return nil
+}
+
+type submittedOffset struct {
+	gtp      groupTopicPartition
+	offset   int64
+	metadata string
+	resultCh chan<- commitResult
+}
+
+type commitResult struct {
+	offsetCommit submittedOffset
+	response     *OffsetCommitResponse
+}
+
+// brokerOffsetMgr aggregates submitted offsets from partition offset managers
+// and periodically commits them to Kafka.
+type brokerOffsetMgr struct {
+	baseCID            *ContextID
+	config             *Config
+	conn               *Broker
+	submittedOffsetsCh chan submittedOffset
+	offsetBatches      chan map[string]map[groupTopicPartition]submittedOffset
+	wg                 sync.WaitGroup
+}
+
+func (om *offsetManager) spawnBrokerExecutor(brokerConn *Broker) brokerExecutor {
+	bom := &brokerOffsetMgr{
+		baseCID:            om.baseCID.NewChild(fmt.Sprintf("broker:%d", brokerConn.ID())),
+		config:             om.config,
+		conn:               brokerConn,
+		submittedOffsetsCh: make(chan submittedOffset),
+		offsetBatches:      make(chan map[string]map[groupTopicPartition]submittedOffset),
+	}
+	spawn(&bom.wg, bom.batchSubmitted)
+	spawn(&bom.wg, bom.executeBatches)
+	return bom
+}
+
+func (bom *brokerOffsetMgr) brokerConn() *Broker {
+	return bom.conn
+}
+
+func (bom *brokerOffsetMgr) close() {
+	close(bom.submittedOffsetsCh)
+	bom.wg.Wait()
+}
+
+func (bom *brokerOffsetMgr) batchSubmitted() {
+	defer bom.baseCID.NewChild("batchSubmitted").LogScope()()
+	defer close(bom.offsetBatches)
+
+	batchCommit := make(map[string]map[groupTopicPartition]submittedOffset)
+	var nilOrOffsetBatchesCh chan map[string]map[groupTopicPartition]submittedOffset
+	for {
+		select {
+		case so, ok := <-bom.submittedOffsetsCh:
+			if !ok {
+				return
+			}
+			groupOffsets := batchCommit[so.gtp.group]
+			if groupOffsets == nil {
+				groupOffsets = make(map[groupTopicPartition]submittedOffset)
+				batchCommit[so.gtp.group] = groupOffsets
+			}
+			groupOffsets[so.gtp] = so
+			nilOrOffsetBatchesCh = bom.offsetBatches
+		case nilOrOffsetBatchesCh <- batchCommit:
+			nilOrOffsetBatchesCh = nil
+			batchCommit = make(map[string]map[groupTopicPartition]submittedOffset)
+		}
+	}
+}
+
+func (bom *brokerOffsetMgr) executeBatches() {
+	cid := bom.baseCID.NewChild("executeBatches")
+	defer cid.LogScope()()
+
+	var nilOrOffsetBatchesCh chan map[string]map[groupTopicPartition]submittedOffset
+	var lastErr error
+	var lastErrTime time.Time
+	commitTicker := time.NewTicker(bom.config.Consumer.Offsets.CommitInterval)
+	defer commitTicker.Stop()
+offsetCommitLoop:
+	for {
+		select {
+		case <-commitTicker.C:
+			nilOrOffsetBatchesCh = bom.offsetBatches
+		case batchedOffsets, ok := <-nilOrOffsetBatchesCh:
+			if !ok {
+				return
+			}
+			// Ignore submit requests for awhile after a connection failure to
+			// allow the Kafka cluster some time to recuperate. Ignored requests
+			// will be retried by originating partition offset managers.
+			if time.Now().UTC().Sub(lastErrTime) < bom.config.Consumer.Retry.Backoff {
+				continue offsetCommitLoop
+			}
+			nilOrOffsetBatchesCh = nil
+			for group, groupOffsets := range batchedOffsets {
+				req := &OffsetCommitRequest{
+					Version:                 1,
+					ConsumerGroup:           group,
+					ConsumerGroupGeneration: GroupGenerationUndefined,
+				}
+				for _, so := range groupOffsets {
+					req.AddBlock(so.gtp.topic, so.gtp.partition, so.offset, ReceiveTime, so.metadata)
+				}
+				var res *OffsetCommitResponse
+				res, lastErr = bom.conn.CommitOffset(req)
+				if lastErr != nil {
+					lastErrTime = time.Now().UTC()
+					bom.conn.Close()
+					Logger.Printf("<%s> connection reset: err=(%v)", cid, lastErr)
+					continue offsetCommitLoop
+				}
+				// Fan the response out to the partition offset managers.
+				for _, so := range groupOffsets {
+					so.resultCh <- commitResult{so, res}
+				}
 			}
 		}
 	}
 }
 
-func (bom *brokerOffsetManager) flushToBroker() {
-	request := bom.constructRequest()
-	if request == nil {
-		return
+func (bom *brokerOffsetMgr) String() string {
+	if bom == nil {
+		return "<nil>"
 	}
-
-	response, err := bom.broker.CommitOffset(request)
-
-	if err != nil {
-		bom.abort(err)
-		return
-	}
-
-	for s := range bom.subscriptions {
-		if request.blocks[s.topic] == nil || request.blocks[s.topic][s.partition] == nil {
-			continue
-		}
-
-		var err KError
-		var ok bool
-
-		if response.Errors[s.topic] == nil {
-			s.handleError(ErrIncompleteResponse)
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
-			continue
-		}
-		if err, ok = response.Errors[s.topic][s.partition]; !ok {
-			s.handleError(ErrIncompleteResponse)
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
-			continue
-		}
-
-		switch err {
-		case ErrNoError:
-			block := request.blocks[s.topic][s.partition]
-			s.updateCommitted(block.offset, block.metadata)
-			break
-		case ErrUnknownTopicOrPartition, ErrNotLeaderForPartition, ErrLeaderNotAvailable:
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
-		default:
-			s.handleError(err)
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
-		}
-	}
-}
-
-func (bom *brokerOffsetManager) constructRequest() *OffsetCommitRequest {
-	r := &OffsetCommitRequest{
-		Version:                 1,
-		ConsumerGroup:           bom.parent.group,
-		ConsumerGroupGeneration: GroupGenerationUndefined,
-	}
-
-	for s := range bom.subscriptions {
-		s.lock.Lock()
-		if s.dirty {
-			r.AddBlock(s.topic, s.partition, s.offset, ReceiveTime, s.metadata)
-		}
-		s.lock.Unlock()
-	}
-
-	if len(r.blocks) > 0 {
-		return r
-	}
-
-	return nil
-}
-
-func (bom *brokerOffsetManager) abort(err error) {
-	_ = bom.broker.Close() // we don't care about the error this might return, we already have one
-	bom.parent.abandonBroker(bom)
-
-	for pom := range bom.subscriptions {
-		pom.handleError(err)
-		pom.rebalance <- none{}
-	}
-
-	for s := range bom.updateSubscriptions {
-		if _, ok := bom.subscriptions[s]; !ok {
-			s.handleError(err)
-			s.rebalance <- none{}
-		}
-	}
-
-	bom.subscriptions = make(map[*partitionOffsetManager]none)
+	return bom.baseCID.String()
 }
